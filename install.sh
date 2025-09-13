@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -------------------- helpers --------------------
+# ==================== helpers & CLI ====================
 require_root(){ [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }; }
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-
 sanitize_hostname(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'; }
-
 prompt(){ local v="$1" m="$2" d="${3:-}"; if [[ -n "${!v:-}" ]]; then return; fi; read -rp "$m${d:+ [$d]}: " x; [[ -z "$x" && -n "$d" ]] && x="$d"; declare -g "$v"="$x"; }
 prompt_secret(){ local v="$1" m="$2"; if [[ -n "${!v:-}" ]]; then return; fi; read -rsp "$m: " x; echo; declare -g "$v"="$x"; }
 
@@ -21,7 +19,7 @@ maybe_prompt_reboot_and_exit(){
     echo "A reboot is required to continue."
     read -rp "Reboot now? (y/n) " yn
     if [[ "${yn,,}" == "y" ]]; then
-      echo "After reboot, log in and run this same script again to continue."
+      echo "After reboot, run this script again to continue."
       sleep 2
       reboot
     else
@@ -31,7 +29,17 @@ maybe_prompt_reboot_and_exit(){
   fi
 }
 
-# -------------------- state & config --------------------
+usage(){
+  cat <<USAGE
+Usage: sudo bash $0 [--fresh | --fresh-keep-conf | --help]
+
+--fresh              Wipe saved state AND config, re-run the wizard, start over.
+--fresh-keep-conf    Wipe only step markers; keep /etc/redline/dropbox.conf answers.
+--help               Show this help.
+USAGE
+}
+
+# ==================== state & config ====================
 require_root
 LOGFILE="/var/log/kali_dropbox_setup.log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -64,10 +72,38 @@ EOF
 }
 load_conf(){ [[ -f "$CONF_FILE" ]] && source "$CONF_FILE" || true; }
 
+reset_state_only(){
+  rm -f "${STATE_DIR}/"*.done 2>/dev/null || true
+  echo "State cleared (kept ${CONF_FILE})."
+}
+reset_all(){
+  rm -f "${STATE_DIR}/"*.done 2>/dev/null || true
+  rm -f "$CONF_FILE" 2>/dev/null || true
+  echo "State and config cleared."
+}
+
+# parse CLI
+case "${1:-}" in
+  --fresh)
+    echo "This will wipe progress and config, starting from scratch."
+    read -rp "Proceed? (type YES to confirm): " c; [[ "$c" == "YES" ]] || { echo "Aborted."; exit 1; }
+    reset_all
+    ;;
+  --fresh-keep-conf)
+    echo "This will wipe progress markers but keep ${CONF_FILE}."
+    read -rp "Proceed? (type YES to confirm): " c; [[ "$c" == "YES" ]] || { echo "Aborted."; exit 1; }
+    reset_state_only
+    ;;
+  --help)
+    usage; exit 0;;
+  "") ;;
+  *) usage; exit 1;;
+esac
+
 echo; log "Kali Dropbox Setup starting"
 load_conf
 
-# -------------------- prereq wizard (runs once) --------------------
+# ==================== prereq wizard (runs once) ====================
 if ! donep prereq; then
   prompt CLIENT_NAME "Client company name (e.g., Acme123)"
   suggest="$(sanitize_hostname "$CLIENT_NAME")"; [[ -z "$suggest" ]] && suggest="client"
@@ -76,18 +112,21 @@ if ! donep prereq; then
   prompt HOSTNAME "Confirm or enter alternate hostname" "$suggest"
   HOSTNAME="$(sanitize_hostname "$HOSTNAME")"; [[ -z "$HOSTNAME" ]] && { echo "Hostname cannot be empty"; exit 1; }
 
-  echo; echo "DigitalOcean droplet bootstrap (one time; switches to key-only after setup)"
+  echo
+  echo "DigitalOcean droplet bootstrap (one time; switches to key-only after setup)"
   prompt DROPLET_IP "Droplet public IP or DNS"
   prompt DROPLET_SSH_PORT "Droplet SSH port" "22"
   prompt DROPLET_ROOT "Droplet root username" "root"
-  prompt_secret DROPLET_PW "Droplet root password (used once to install key and then disabled)"
+  prompt_secret DROPLET_PW "Droplet root password (used once to install key, then disabled)"
   prompt TUNNEL_USER "Dedicated tunnel username to create on droplet" "tunnel"
 
-  echo; echo "Reverse SSH settings"
+  echo
+  echo "Reverse SSH settings"
   prompt REVERSE_REMOTE_PORT "Remote port for SSH on droplet" "20022"
   prompt REVERSE_BIND_ADDR "Bind address on droplet for SSH reverse (localhost or 0.0.0.0)" "localhost"
 
-  echo; read -rp "Enable RDP on this box? (y/n) " yn; [[ "${yn,,}" == "y" ]] && ENABLE_RDP="yes" || ENABLE_RDP="no"
+  echo
+  read -rp "Enable RDP on this box? (y/n) " yn; [[ "${yn,,}" == "y" ]] && ENABLE_RDP="yes" || ENABLE_RDP="no"
   EXPOSE_RDP_VIA_DROPLET="no"; RDP_REMOTE_PORT=""; RDP_BIND_ADDR="localhost"
   if [[ "$ENABLE_RDP" == "yes" ]]; then
     read -rp "Also expose RDP via droplet? (y/n) " yn2
@@ -98,7 +137,8 @@ if ! donep prereq; then
     fi
   fi
 
-  echo; echo "----- Review -----"
+  echo
+  echo "----- Review -----"
   echo "Client:            $CLIENT_NAME"
   echo "Hostname:          $HOSTNAME"
   echo "Droplet root:      $DROPLET_ROOT@$DROPLET_IP:$DROPLET_SSH_PORT"
@@ -115,7 +155,7 @@ if ! donep prereq; then
 fi
 load_conf
 
-# -------------------- steps --------------------
+# ==================== steps ====================
 # 1 hostname and time
 if ! donep step1; then
   log "Configuring hostname"
@@ -151,7 +191,7 @@ if ! donep step3; then
   maybe_prompt_reboot_and_exit
 fi
 
-# 4 tooling (includes xrdp bits if chosen)
+# 4 tooling (includes xrdp if chosen)
 if ! donep step4; then
   log "Installing core tools"
   apt-get update -y
@@ -167,7 +207,6 @@ if ! donep step4; then
   if [[ "$ENABLE_RDP" == "yes" ]]; then
     log "Enabling RDP"
     apt-get install -y xrdp xorgxrdp
-    # package creates the xrdp user; still make it idempotent
     id -u xrdp >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin xrdp || true
     adduser xrdp ssl-cert || true
     echo "startxfce4" > /home/pentester/.xsession
@@ -194,7 +233,7 @@ if ! donep step5; then
   mark step5
 fi
 
-# 6 ensure local key for pentester
+# 6 ensure local key
 if ! donep step6; then
   log "Ensuring SSH key for pentester"
   runuser -l pentester -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
@@ -204,7 +243,7 @@ if ! donep step6; then
   mark step6
 fi
 
-# 7 droplet bootstrap: try key first, else use one-time root pw then lock down to keys
+# 7 droplet bootstrap (key first; else one-time root password; then key-only)
 if ! donep step7; then
   log "Checking droplet key access"
   if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" true 2>/dev/null; then
@@ -213,7 +252,7 @@ if ! donep step7; then
     log "Bootstrapping droplet using root password"
     PUB=/home/pentester/.ssh/id_ed25519.pub
     [[ -f "$PUB" ]] || { echo "Missing $PUB"; exit 1; }
-    # create user, install key, harden sshd
+
     sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" bash -lc "'
       set -e
       id -u ${TUNNEL_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash ${TUNNEL_USER}
@@ -231,7 +270,7 @@ if ! donep step7; then
       sed -i \"s/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/\" \"\$CFG\"
       sed -i \"s/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/\" \"\$CFG\"
     '"
-    if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "$RDP_BIND_ADDR" == "0.0.0.0" ]]; then
+    if [[ "${REVERSE_BIND_ADDR}" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
       sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" bash -lc "'
         CFG=/etc/ssh/sshd_config
         grep -q \"^GatewayPorts \" \"\$CFG\" && sed -i \"s/^GatewayPorts .*/GatewayPorts clientspecified/\" \"\$CFG\" || echo \"GatewayPorts clientspecified\" >> \"\$CFG\"
