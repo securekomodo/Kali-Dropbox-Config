@@ -88,7 +88,7 @@ load_conf(){ [[ -f "$CONF_FILE" ]] && source "$CONF_FILE" || true; }
 reset_state_only(){ rm -f "${STATE_DIR}/"*.done 2>/dev/null || true; echo "State cleared (kept ${CONF_FILE})."; }
 reset_all(){ rm -f "${STATE_DIR}/"*.done 2>/dev/null || true; rm -f "$CONF_FILE" 2>/dev/null || true; echo "State and config cleared."; }
 
-# ensure pentester key exists and handy SSH alias is created (for info)
+# ensure pentester key exists and show it (never overwrites existing keys)
 ensure_local_ssh_identity() {
   local uhome="/home/pentester"
   local sshdir="$uhome/.ssh"
@@ -116,7 +116,7 @@ ensure_local_ssh_identity() {
   echo "[INFO] Fingerprint:"
   ssh-keygen -lf "${pub}" -E sha256 || true
 
-  # Save a short alias template for convenience (not required)
+  # Optional alias template (updated after wizard vars exist)
   local conf="$sshdir/config"
   touch "$conf"; chown pentester:pentester "$conf"; chmod 600 "$conf"
   awk 'BEGIN{skip=0} /^Host do-droplet$/{skip=1} skip&&/^[[:space:]]*$/ {skip=0; next} !skip {print}' "$conf" > "${conf}.tmp" 2>/dev/null || true
@@ -172,7 +172,6 @@ load_conf
 
 # ===================== prereq wizard (once) =====================
 if ! donep prereq; then
-  # generate key up front and show it
   ensure_local_ssh_identity
 
   prompt CLIENT_NAME "Client company name (e.g., Acme123)"
@@ -207,7 +206,7 @@ if ! donep prereq; then
   fi
 
   echo
-  read -rp "After setup, remove the pentester key from ROOT on the droplet (recommended)? (y/n) " yn3
+  read -rp "After setup, remove the pentester key from ROOT on the droplet (others untouched)? (y/n) " yn3
   [[ "${yn3,,}" == "n" ]] && REMOVE_PENTESTER_KEY_FROM_ROOT="no" || REMOVE_PENTESTER_KEY_FROM_ROOT="yes"
 
   read -rp "Disable SSH password authentication on the droplet after setup? (y/n) " yn4
@@ -228,10 +227,8 @@ if ! donep prereq; then
   echo "Disable SSH password authentication:        $DISABLE_PASSWORD_AUTH"
   echo "------------------"
   echo
-  echo "IMPORTANT: Add the pentester PUBLIC KEY (shown above) to the droplet ROOT account now:"
-  echo "  - Use DO console or existing admin access"
-  echo "  - File: /root/.ssh/authorized_keys"
-  echo "Press Enter when key login for root is ready; the script will verify."
+  echo "IMPORTANT: add the pentester PUBLIC KEY (shown above) to /root/.ssh/authorized_keys on the droplet now."
+  echo "Press Enter when root key login should work; the script will verify and continue."
   read -r _
 
   save_conf
@@ -275,7 +272,7 @@ if ! donep step3; then
   maybe_prompt_reboot_and_exit
 fi
 
-# 4 core tooling (NO BloodHound)
+# 4 core tooling (no BloodHound)
 if ! donep step4; then
   log "Installing core tools"
   apt-get update -y
@@ -285,7 +282,7 @@ if ! donep step4; then
     nmap masscan amass crackmapexec \
     feroxbuster gobuster ffuf \
     impacket-scripts responder \
-    net-tools dnsutils socat autossh sshpass ufw \
+    net-tools dnsutils socat autossh ufw \
     nuclei zaproxy chromium openssh-server htop seclists
   runuser -l pentester -c 'nuclei -update-templates || true'
   systemctl enable ssh; systemctl restart ssh
@@ -310,7 +307,7 @@ if ! donep step4; then
   maybe_prompt_reboot_and_exit
 fi
 
-# 5 sshd hardening (LOCAL)
+# 5 sshd hardening (local)
 if ! donep step5; then
   log "Hardening local sshd"
   sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
@@ -324,7 +321,7 @@ if ! donep step5; then
   mark step5
 fi
 
-# 6 ensure local key (already ensured, but mark step)
+# 6 ensure local key and alias
 if ! donep step6; then
   log "Ensuring SSH key and alias for pentester"
   ensure_local_ssh_identity
@@ -334,7 +331,6 @@ fi
 # 7 droplet bootstrap via ROOT key only (no passwords)
 if ! donep step7; then
   log "Verifying root@${DROPLET_IP} key login"
-  # loop until key login to root works (user may still be adding the key)
   local_pub="$(get_pentester_pub || true)"
   if [[ -z "${local_pub:-}" ]]; then echo "No local pentester public key found"; exit 1; fi
 
@@ -343,7 +339,7 @@ if ! donep step7; then
       log "Root key login ok."
       break
     fi
-    echo "Root key login not working yet. Ensure the BELOW line exists in /root/.ssh/authorized_keys on the droplet:"
+    echo "Root key login not working yet. Ensure this line exists in /root/.ssh/authorized_keys on the droplet:"
     cat "$local_pub"
     read -rp "Press Enter to retry root key login..." _
   done
@@ -354,8 +350,19 @@ if ! donep step7; then
   remote_root_key_scp "$local_pub" "/tmp/pentester_key.pub"
   remote_root_key_ssh "auth='/home/$TUNNEL_USER/.ssh/authorized_keys'; touch \"\$auth\"; \
     grep -qxF \"\$(cat /tmp/pentester_key.pub)\" \"\$auth\" || cat /tmp/pentester_key.pub >> \"\$auth\"; \
-    rm -f /tmp/pentester_key.pub; chown -R $TUNNEL_USER:$TUNNEL_USER /home/$TUNNEL_USER/.ssh; chmod 600 \"\$auth\""
+    rm -f /tmp/pentester_key.pub; chown -R $TUNNEL_USER:$TUNNEL_USER /home/$TUNNEL_USER/.ssh; chmod 700 /home/$TUNNEL_USER/.ssh; chmod 600 \"\$auth\""
 
+  # sanity: verify tunnel login using the pentester key explicitly
+  PKEY="/home/pentester/.ssh/id_ed25519"; [[ -f "$PKEY" ]] || PKEY="/home/pentester/.ssh/id_rsa"
+  if sudo -u pentester ssh -i "$PKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+      -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" true 2>/dev/null; then
+    log "Tunnel user key login verified."
+  else
+    echo "[ERROR] Could not log in as $TUNNEL_USER via key. Check /home/$TUNNEL_USER/.ssh/authorized_keys on droplet."
+    exit 1
+  fi
+
+  # optional: remove this exact pentester key from root, leaving any other root keys untouched
   if [[ "${REMOVE_PENTESTER_KEY_FROM_ROOT}" == "yes" ]]; then
     log "[Droplet] removing pentester key from ROOT authorized_keys (others untouched)"
     remote_root_key_scp "$local_pub" "/tmp/pk.pub"
@@ -363,27 +370,19 @@ if ! donep step7; then
       awk 'NR==FNR{a[\$0]=1;next}!a[\$0]' /tmp/pk.pub \"\$R\" > \"\${R}.new\"; mv \"\${R}.new\" \"\$R\"; rm -f /tmp/pk.pub; chmod 600 \"\$R\""
   fi
 
+  # optional: tighten droplet auth to key-only and allow forwarding; adjust GatewayPorts if needed
   if [[ "${DISABLE_PASSWORD_AUTH}" == "yes" ]]; then
     log "[Droplet] disabling SSH password authentication (key-only)"
     remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
       sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' \"\$CFG\"; \
       sed -i 's/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' \"\$CFG\"; \
       sed -i 's/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/' \"\$CFG\""
-    # Only adjust GatewayPorts if you chose 0.0.0.0 bind
     if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
       remote_root_key_ssh "CFG=/etc/ssh/sshd_config; \
         grep -q '^GatewayPorts ' \"\$CFG\" && sed -i 's/^GatewayPorts .*/GatewayPorts clientspecified/' \"\$CFG\" || \
         echo 'GatewayPorts clientspecified' >> \"\$CFG\""
     fi
     remote_root_key_ssh "systemctl restart ssh"
-  fi
-
-  # sanity: tunnel key login should now work
-  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" true 2>/dev/null; then
-    log "Tunnel user key login verified."
-  else
-    echo "[ERROR] Could not log in as $TUNNEL_USER via key. Check /home/$TUNNEL_USER/.ssh/authorized_keys on droplet."
-    exit 1
   fi
 
   mark step7
@@ -448,7 +447,7 @@ EOF
   mark step8
 fi
 
-# 9 validate helper
+# 9 validation helper
 if ! donep step9; then
   log "Installing validation helper"
   cat >/usr/local/bin/validate_kali.sh <<'EOF'
