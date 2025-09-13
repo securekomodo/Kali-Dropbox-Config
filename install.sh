@@ -243,44 +243,54 @@ if ! donep step6; then
   mark step6
 fi
 
-# 7 droplet bootstrap (key first; else one-time root password; then key-only)
+# 7 droplet bootstrap (try key first; else prompt for root password and switch to key-only)
 if ! donep step7; then
   log "Checking droplet key access"
   if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" true 2>/dev/null; then
     log "Key access as $TUNNEL_USER already works; skipping bootstrap"
   else
-    log "Bootstrapping droplet using root password"
-    PUB=/home/pentester/.ssh/id_ed25519.pub
-    [[ -f "$PUB" ]] || { echo "Missing $PUB"; exit 1; }
+    [[ -f /home/pentester/.ssh/id_ed25519.pub ]] || { echo "Missing /home/pentester/.ssh/id_ed25519.pub"; exit 1; }
+    [[ -n "${DROPLET_PW:-}" ]] || prompt_secret DROPLET_PW "Droplet root password (used once)"
+    export SSHPASS="$DROPLET_PW"
 
-    sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" bash -lc "'
-      set -e
-      id -u ${TUNNEL_USER} >/dev/null 2>&1 || useradd -m -s /bin/bash ${TUNNEL_USER}
-      mkdir -p /home/${TUNNEL_USER}/.ssh
-      chmod 700 /home/${TUNNEL_USER}/.ssh
-    '"
-    sshpass -p "$DROPLET_PW" scp -o StrictHostKeyChecking=no -P "$DROPLET_SSH_PORT" "$PUB" "$DROPLET_ROOT@$DROPLET_IP:/home/${TUNNEL_USER}/.ssh/authorized_keys"
-    sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" bash -lc "'
-      chown -R ${TUNNEL_USER}:${TUNNEL_USER} /home/${TUNNEL_USER}/.ssh
-      chmod 600 /home/${TUNNEL_USER}/.ssh/authorized_keys
-      CFG=/etc/ssh/sshd_config
-      cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\"
-      sed -i \"s/^#\\?PermitRootLogin .*/PermitRootLogin no/\" \"\$CFG\"
-      sed -i \"s/^#\\?PasswordAuthentication .*/PasswordAuthentication no/\" \"\$CFG\"
-      sed -i \"s/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/\" \"\$CFG\"
-      sed -i \"s/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/\" \"\$CFG\"
-    '"
-    if [[ "${REVERSE_BIND_ADDR}" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
-      sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" bash -lc "'
-        CFG=/etc/ssh/sshd_config
-        grep -q \"^GatewayPorts \" \"\$CFG\" && sed -i \"s/^GatewayPorts .*/GatewayPorts clientspecified/\" \"\$CFG\" || echo \"GatewayPorts clientspecified\" >> \"\$CFG\"
-      '"
+    # create tunnel user and .ssh dir
+    sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no \
+      -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" \
+      "id -u $TUNNEL_USER >/dev/null 2>&1 || useradd -m -s /bin/bash $TUNNEL_USER; \
+       mkdir -p /home/$TUNNEL_USER/.ssh; chmod 700 /home/$TUNNEL_USER/.ssh"
+
+    # push key
+    sshpass -e scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -P "$DROPLET_SSH_PORT" /home/pentester/.ssh/id_ed25519.pub \
+      "$DROPLET_ROOT@$DROPLET_IP:/home/$TUNNEL_USER/.ssh/authorized_keys"
+
+    # permissions and sshd harden
+    HARDEN=$(cat <<'EOS'
+set -e
+chown -R '"$TUNNEL_USER"':'"$TUNNEL_USER"' /home/'"$TUNNEL_USER"'/.ssh
+chmod 600 /home/'"$TUNNEL_USER"'/.ssh/authorized_keys
+CFG=/etc/ssh/sshd_config
+cp -a "$CFG" "${CFG}.bak.$(date +%s)"
+sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' "$CFG"
+sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' "$CFG"
+sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' "$CFG"
+sed -i 's/^#\?AllowTcpForwarding .*/AllowTcpForwarding yes/' "$CFG"
+EOS
+)
+    if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
+      HARDEN="$HARDEN"$'\n''grep -q "^GatewayPorts " "$CFG" && sed -i "s/^GatewayPorts .*/GatewayPorts clientspecified/" "$CFG" || echo "GatewayPorts clientspecified" >> "$CFG"'
     fi
-    sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" systemctl restart ssh
+
+    sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no \
+      -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" "bash -lc '$HARDEN; systemctl restart ssh'"
+
     log "Droplet hardened to key-only, root password login disabled"
   fi
   mark step7
 fi
+
 
 # 8 autossh reverse service
 if ! donep step8; then
