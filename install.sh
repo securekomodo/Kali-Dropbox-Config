@@ -6,7 +6,6 @@ require_root(){ [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }; }
 log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 sanitize_hostname(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'; }
 prompt(){ local v="$1" m="$2" d="${3:-}"; if [[ -n "${!v:-}" ]]; then return; fi; read -rp "$m${d:+ [$d]}: " x; [[ -z "$x" && -n "$d" ]] && x="$d"; declare -g "$v"="$x"; }
-prompt_secret(){ local v="$1" m="$2"; if [[ -n "${!v:-}" ]]; then return; fi; read -rsp "$m: " x; echo; declare -g "$v"="$x"; }
 
 need_reboot(){
   [[ -f /var/run/reboot-required ]] && return 0
@@ -38,15 +37,6 @@ Usage:
   sudo bash kali_dropbox_setup.sh continue
   sudo bash kali_dropbox_setup.sh fresh-keep-conf
   sudo bash kali_dropbox_setup.sh fresh
-
-Commands:
-  help              Show this help (default if no arguments).
-  continue          Resume using saved answers; skip completed steps.
-  fresh-keep-conf   Clear progress markers; keep saved answers; then run.
-  fresh             Clear progress and saved answers; rerun the wizard; then run.
-
-Notes:
-- Password-free bootstrap. You add the pentester public key to droplet ROOT once; the script verifies and continues.
 USAGE
 }
 
@@ -115,7 +105,6 @@ ensure_local_ssh_identity() {
   echo "[INFO] Fingerprint:"
   ssh-keygen -lf "${pub}" -E sha256 || true
 
-  # Optional alias template (updated after wizard vars exist)
   local conf="$sshdir/config"
   touch "$conf"; chown pentester:pentester "$conf"; chmod 600 "$conf"
   awk 'BEGIN{skip=0} /^Host do-droplet$/{skip=1} skip&&/^[[:space:]]*$/ {skip=0; next} !skip {print}' "$conf" > "${conf}.tmp" 2>/dev/null || true
@@ -141,12 +130,12 @@ get_pentester_key(){
   [[ -f /home/pentester/.ssh/id_rsa     ]] && echo "/home/pentester/.ssh/id_rsa" && return
   return 1
 }
-remote_root_key_ssh(){ # args: <cmd...>
+remote_root_key_ssh(){
   local keyfile; keyfile="$(get_pentester_key)"
   ssh -i "$keyfile" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" "$@"
 }
-remote_root_key_scp(){ # args: <src> <dest>
+remote_root_key_scp(){
   local keyfile; keyfile="$(get_pentester_key)"
   scp -i "$keyfile" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       -P "$DROPLET_SSH_PORT" "$1" "$DROPLET_ROOT@$DROPLET_IP:$2"
@@ -334,7 +323,6 @@ if ! donep step7; then
   local_pub="$(get_pentester_pub || true)"
   if [[ -z "${local_pub:-}" ]]; then echo "No local pentester public key found"; exit 1; fi
 
-  # wait until root key login works
   while true; do
     if remote_root_key_ssh true 2>/dev/null; then
       log "Root key login ok."
@@ -345,7 +333,6 @@ if ! donep step7; then
     read -rp "Press Enter to retry root key login..." _
   done
 
-  # seed pentester's known_hosts with the droplet's key for non-interactive service
   sudo -u pentester mkdir -p /home/pentester/.ssh
   sudo -u pentester ssh-keyscan -p "$DROPLET_SSH_PORT" "$DROPLET_IP" >> /home/pentester/.ssh/known_hosts || true
   sudo chown pentester:pentester /home/pentester/.ssh/known_hosts
@@ -369,18 +356,15 @@ if ! donep step7; then
     exit 1
   fi
 
-  # ALWAYS ensure port-forwarding is allowed on droplet
-  log "[Droplet] ensuring AllowTcpForwarding yes (and GatewayPorts if needed)"
-  remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
-    sed -i 's/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/' \"\$CFG\""
+  log "[Droplet] ensuring reverse forwards are allowed"
+  remote_root_key_ssh "install -m 644 /dev/stdin /etc/ssh/sshd_config.d/10-kali-dropbox-tunnels.conf <<'EOF'
+AllowTcpForwarding yes
+EOF"
   if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
-    remote_root_key_ssh "CFG=/etc/ssh/sshd_config; \
-      grep -q '^GatewayPorts ' \"\$CFG\" && sed -i 's/^GatewayPorts .*/GatewayPorts clientspecified/' \"\$CFG\" || \
-      echo 'GatewayPorts clientspecified' >> \"\$CFG\""
+    remote_root_key_ssh "grep -q '^GatewayPorts' /etc/ssh/sshd_config.d/10-kali-dropbox-tunnels.conf || echo 'GatewayPorts clientspecified' >> /etc/ssh/sshd_config.d/10-kali-dropbox-tunnels.conf"
   fi
-  remote_root_key_ssh "systemctl restart ssh"
+  remote_root_key_ssh "sshd -t && systemctl restart ssh"
 
-  # optional key removal from root (after success)
   if [[ "${REMOVE_PENTESTER_KEY_FROM_ROOT}" == "yes" ]]; then
     log "[Droplet] removing pentester key from ROOT authorized_keys (others untouched)"
     remote_root_key_scp "$local_pub" "/tmp/pk.pub"
@@ -388,23 +372,20 @@ if ! donep step7; then
       awk 'NR==FNR{a[\$0]=1;next}!a[\$0]' /tmp/pk.pub \"\$R\" > \"\${R}.new\"; mv \"\${R}.new\" \"\$R\"; rm -f /tmp/pk.pub; chmod 600 \"\$R\""
   fi
 
-  # optional auth tightening
   if [[ "${DISABLE_PASSWORD_AUTH}" == "yes" ]]; then
     log "[Droplet] disabling SSH password authentication (key-only)"
     remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
       sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' \"\$CFG\"; \
-      sed -i 's/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' \"\$CFG\""
-    remote_root_key_ssh "systemctl restart ssh"
+      sed -i 's/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' \"\$CFG\"; systemctl restart ssh"
   fi
 
   mark step7
 fi
 
-# 8 autossh reverse service
+# 8 autossh reverse service (permissions fixed here)
 if ! donep step8; then
   log "Creating autossh reverse-tunnel service"
 
-  # choose correct key path for service
   KEY_PATH="/home/pentester/.ssh/id_ed25519"
   [[ -f "$KEY_PATH" ]] || KEY_PATH="/home/pentester/.ssh/id_rsa"
 
@@ -424,43 +405,56 @@ LOCAL_RDP_PORT="3389"
 PENTESTER_HOME="/home/pentester"
 KEY_PATH="${KEY_PATH}"
 EOF
-  chmod 600 /etc/autossh-reverse-tunnel.conf
+  # critical: allow the service (user=pendester) to read this config
+  chown root:pentester /etc/autossh-reverse-tunnel.conf
+  chmod 640 /etc/autossh-reverse-tunnel.conf
 
   cat >/usr/local/bin/start-reverse-tunnel.sh <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/autossh-reverse-tunnel.conf
-CMD=(/usr/bin/autossh -M 0 -N
-     -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes"
-     -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${PENTESTER_HOME}/.ssh/known_hosts"
-     -i "${KEY_PATH}"
-     -R "${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}")
-if [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" && -n "${RDP_REMOTE_PORT}" ]]; then
-  CMD+=(-R "${RDP_BIND_ADDR}:${RDP_REMOTE_PORT}:localhost:${LOCAL_RDP_PORT}")
-fi
-CMD+=(-p "${DROPLET_SSH_PORT}" "${TUNNEL_USER}@${DROPLET_IP}")
-exec "${CMD[@]}"
+KEY_PATH="${KEY_PATH:-${PENTESTER_HOME}/.ssh/id_ed25519}"
+[ -f "$KEY_PATH" ] || KEY_PATH="${PENTESTER_HOME}/.ssh/id_rsa"
+exec /usr/bin/autossh -M 0 -N -vv \
+  -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes" \
+  -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${PENTESTER_HOME}/.ssh/known_hosts" \
+  -i "${KEY_PATH}" \
+  -R "${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}" \
+  $( [ "${EXPOSE_RDP_VIA_DROPLET}" = "yes" ] && echo -R "${RDP_BIND_ADDR}:${RDP_REMOTE_PORT}:localhost:${LOCAL_RDP_PORT}" ) \
+  -p "${DROPLET_SSH_PORT}" "${TUNNEL_USER}@${DROPLET_IP}"
 EOS
-  chmod +x /usr/local/bin/start-reverse-tunnel.sh
+  chown root:root /usr/local/bin/start-reverse-tunnel.sh
+  chmod 755 /usr/local/bin/start-reverse-tunnel.sh
 
   cat >/etc/systemd/system/autossh-reverse-tunnel.service <<'EOF'
 [Unit]
 Description=Persistent reverse SSH tunnel to droplet (SSH and optional RDP)
 After=network-online.target ssh.service
 Wants=network-online.target
+
 [Service]
 Type=simple
 EnvironmentFile=/etc/autossh-reverse-tunnel.conf
+Environment=AUTOSSH_GATETIME=0
+Environment=AUTOSSH_PORT=0
+Environment=AUTOSSH_DEBUG=1
+Environment=AUTOSSH_LOGFILE=/var/log/autossh-reverse.log
 User=pentester
 Group=pentester
 ExecStart=/usr/local/bin/start-reverse-tunnel.sh
 Restart=always
-RestartSec=5s
+RestartSec=3s
 NoNewPrivileges=yes
 PrivateTmp=yes
+StandardOutput=append:/var/log/autossh-reverse.log
+StandardError=append:/var/log/autossh-reverse.log
+
 [Install]
 WantedBy=multi-user.target
 EOF
+  touch /var/log/autossh-reverse.log
+  chown pentester:pentester /var/log/autossh-reverse.log
+  chmod 640 /var/log/autossh-reverse.log
 
   systemctl daemon-reload
   systemctl enable --now autossh-reverse-tunnel.service
@@ -468,14 +462,13 @@ EOF
   mark step8
 fi
 
-# 9 validation helper (also checks remote port on droplet)
+# 9 validation helper
 if ! donep step9; then
   log "Installing validation helper"
   cat >/usr/local/bin/validate_kali.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 err=0; chk(){ printf "%-44s" "$1"; shift; if "$@"; then echo ok; else echo fail; err=1; fi; }
-# local checks
 chk "Hostname set" bash -c '[[ -n "$(hostname)" ]]'
 chk "User pentester exists" id pentester
 chk "SSHD active" systemctl is-active --quiet ssh
@@ -487,11 +480,10 @@ if systemctl list-unit-files | grep -q '^xrdp.service'; then
   chk "xrdp-sesman active" systemctl is-active --quiet xrdp-sesman
   chk "RDP port 3389 listening" bash -c 'ss -lnt | grep -q ":3389 "'
 fi
-# remote check: is reverse port listening on droplet?
 if [[ -f /etc/autossh-reverse-tunnel.conf ]]; then
   # shellcheck disable=SC1091
   source /etc/autossh-reverse-tunnel.conf
-  PKEY="${PENTESTER_HOME}/.ssh/id_ed25519"; [[ -f "$PKEY" ]] || PKEY="${PENTESTER_HOME}/.ssh/id_rsa"
+  PKEY="/home/pentester/.ssh/id_ed25519"; [[ -f "$PKEY" ]] || PKEY="/home/pentester/.ssh/id_rsa"
   chk "Reverse port open on droplet" sudo -u pentester ssh -i "$PKEY" -o BatchMode=yes -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" "ss -lnt | grep -q ':${REVERSE_REMOTE_PORT} '"
 fi
 echo "Done. Errors: $err"; exit $err
