@@ -46,7 +46,7 @@ Commands:
   fresh             Clear progress and saved answers; rerun the wizard; then run.
 
 Notes:
-- Password-free bootstrap. You will add the pentester public key to droplet ROOT once, then the script verifies and continues.
+- Password-free bootstrap. You add the pentester public key to droplet ROOT once; the script verifies and continues.
 USAGE
 }
 
@@ -328,7 +328,7 @@ if ! donep step6; then
   mark step6
 fi
 
-# 7 droplet bootstrap via ROOT key only
+# 7 droplet bootstrap via ROOT key only (no passwords)
 if ! donep step7; then
   log "Verifying root@${DROPLET_IP} key login"
   local_pub="$(get_pentester_pub || true)"
@@ -345,7 +345,7 @@ if ! donep step7; then
     read -rp "Press Enter to retry root key login..." _
   done
 
-  # seed pentester's known_hosts with the droplet's key
+  # seed pentester's known_hosts with the droplet's key for non-interactive service
   sudo -u pentester mkdir -p /home/pentester/.ssh
   sudo -u pentester ssh-keyscan -p "$DROPLET_SSH_PORT" "$DROPLET_IP" >> /home/pentester/.ssh/known_hosts || true
   sudo chown pentester:pentester /home/pentester/.ssh/known_hosts
@@ -369,7 +369,18 @@ if ! donep step7; then
     exit 1
   fi
 
-  # optional key removal from root
+  # ALWAYS ensure port-forwarding is allowed on droplet
+  log "[Droplet] ensuring AllowTcpForwarding yes (and GatewayPorts if needed)"
+  remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
+    sed -i 's/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/' \"\$CFG\""
+  if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
+    remote_root_key_ssh "CFG=/etc/ssh/sshd_config; \
+      grep -q '^GatewayPorts ' \"\$CFG\" && sed -i 's/^GatewayPorts .*/GatewayPorts clientspecified/' \"\$CFG\" || \
+      echo 'GatewayPorts clientspecified' >> \"\$CFG\""
+  fi
+  remote_root_key_ssh "systemctl restart ssh"
+
+  # optional key removal from root (after success)
   if [[ "${REMOVE_PENTESTER_KEY_FROM_ROOT}" == "yes" ]]; then
     log "[Droplet] removing pentester key from ROOT authorized_keys (others untouched)"
     remote_root_key_scp "$local_pub" "/tmp/pk.pub"
@@ -377,18 +388,12 @@ if ! donep step7; then
       awk 'NR==FNR{a[\$0]=1;next}!a[\$0]' /tmp/pk.pub \"\$R\" > \"\${R}.new\"; mv \"\${R}.new\" \"\$R\"; rm -f /tmp/pk.pub; chmod 600 \"\$R\""
   fi
 
-  # optional hardening to key-only and forwarding
+  # optional auth tightening
   if [[ "${DISABLE_PASSWORD_AUTH}" == "yes" ]]; then
     log "[Droplet] disabling SSH password authentication (key-only)"
     remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
       sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' \"\$CFG\"; \
-      sed -i 's/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' \"\$CFG\"; \
-      sed -i 's/^#\\?AllowTcpForwarding .*/AllowTcpForwarding yes/' \"\$CFG\""
-    if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "${RDP_BIND_ADDR:-}" == "0.0.0.0" ]]; then
-      remote_root_key_ssh "CFG=/etc/ssh/sshd_config; \
-        grep -q '^GatewayPorts ' \"\$CFG\" && sed -i 's/^GatewayPorts .*/GatewayPorts clientspecified/' \"\$CFG\" || \
-        echo 'GatewayPorts clientspecified' >> \"\$CFG\""
-    fi
+      sed -i 's/^#\\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' \"\$CFG\""
     remote_root_key_ssh "systemctl restart ssh"
   fi
 
@@ -398,6 +403,11 @@ fi
 # 8 autossh reverse service
 if ! donep step8; then
   log "Creating autossh reverse-tunnel service"
+
+  # choose correct key path for service
+  KEY_PATH="/home/pentester/.ssh/id_ed25519"
+  [[ -f "$KEY_PATH" ]] || KEY_PATH="/home/pentester/.ssh/id_rsa"
+
   cat >/etc/autossh-reverse-tunnel.conf <<EOF
 AUTOSSH_GATETIME=0
 AUTOSSH_PORT=0
@@ -412,6 +422,7 @@ RDP_REMOTE_PORT="${RDP_REMOTE_PORT}"
 LOCAL_SSH_PORT="22"
 LOCAL_RDP_PORT="3389"
 PENTESTER_HOME="/home/pentester"
+KEY_PATH="${KEY_PATH}"
 EOF
   chmod 600 /etc/autossh-reverse-tunnel.conf
 
@@ -422,7 +433,7 @@ source /etc/autossh-reverse-tunnel.conf
 CMD=(/usr/bin/autossh -M 0 -N
      -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes"
      -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${PENTESTER_HOME}/.ssh/known_hosts"
-     -i "${PENTESTER_HOME}/.ssh/id_ed25519"
+     -i "${KEY_PATH}"
      -R "${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}")
 if [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" && -n "${RDP_REMOTE_PORT}" ]]; then
   CMD+=(-R "${RDP_BIND_ADDR}:${RDP_REMOTE_PORT}:localhost:${LOCAL_RDP_PORT}")
@@ -450,18 +461,21 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+
   systemctl daemon-reload
   systemctl enable --now autossh-reverse-tunnel.service
+  sleep 2
   mark step8
 fi
 
-# 9 validation helper
+# 9 validation helper (also checks remote port on droplet)
 if ! donep step9; then
   log "Installing validation helper"
   cat >/usr/local/bin/validate_kali.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 err=0; chk(){ printf "%-44s" "$1"; shift; if "$@"; then echo ok; else echo fail; err=1; fi; }
+# local checks
 chk "Hostname set" bash -c '[[ -n "$(hostname)" ]]'
 chk "User pentester exists" id pentester
 chk "SSHD active" systemctl is-active --quiet ssh
@@ -472,6 +486,13 @@ if systemctl list-unit-files | grep -q '^xrdp.service'; then
   chk "xrdp active" systemctl is-active --quiet xrdp
   chk "xrdp-sesman active" systemctl is-active --quiet xrdp-sesman
   chk "RDP port 3389 listening" bash -c 'ss -lnt | grep -q ":3389 "'
+fi
+# remote check: is reverse port listening on droplet?
+if [[ -f /etc/autossh-reverse-tunnel.conf ]]; then
+  # shellcheck disable=SC1091
+  source /etc/autossh-reverse-tunnel.conf
+  PKEY="${PENTESTER_HOME}/.ssh/id_ed25519"; [[ -f "$PKEY" ]] || PKEY="${PENTESTER_HOME}/.ssh/id_rsa"
+  chk "Reverse port open on droplet" sudo -u pentester ssh -i "$PKEY" -o BatchMode=yes -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" "ss -lnt | grep -q ':${REVERSE_REMOTE_PORT} '"
 fi
 echo "Done. Errors: $err"; exit $err
 EOF
