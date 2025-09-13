@@ -46,8 +46,7 @@ Commands:
   fresh             Clear progress and saved answers; rerun the wizard; then run.
 
 Notes:
-- No passwords are used for droplet bootstrap. You must add the pentester public key to droplet ROOT first.
-- The script can remove that pentester key from ROOT after it migrates the key into the tunnel account.
+- Password-free bootstrap. You will add the pentester public key to droplet ROOT once, then the script verifies and continues.
 USAGE
 }
 
@@ -131,15 +130,15 @@ EOF
   chown pentester:pentester "$conf"; chmod 600 "$conf"
 }
 
-# SSH wrappers using pentester key (no passwords)
+# SSH wrappers using pentester key
 get_pentester_pub(){
   [[ -f /home/pentester/.ssh/id_ed25519.pub ]] && echo "/home/pentester/.ssh/id_ed25519.pub" && return
-  [[ -f /home/pentester/.ssh/id_rsa.pub ]] && echo "/home/pentester/.ssh/id_rsa.pub" && return
+  [[ -f /home/pentester/.ssh/id_rsa.pub   ]] && echo "/home/pentester/.ssh/id_rsa.pub" && return
   return 1
 }
 get_pentester_key(){
   [[ -f /home/pentester/.ssh/id_ed25519 ]] && echo "/home/pentester/.ssh/id_ed25519" && return
-  [[ -f /home/pentester/.ssh/id_rsa ]] && echo "/home/pentester/.ssh/id_rsa" && return
+  [[ -f /home/pentester/.ssh/id_rsa     ]] && echo "/home/pentester/.ssh/id_rsa" && return
   return 1
 }
 remote_root_key_ssh(){ # args: <cmd...>
@@ -190,7 +189,7 @@ if ! donep prereq; then
 
   echo
   echo "Reverse SSH settings"
-  prompt REVERSE_REMOTE_PORT "Remote port for SSH on droplet" "20022"
+  prompt REVERSE_REMOTE_PORT "Remote port for SSH on droplet" "2222"
   prompt REVERSE_BIND_ADDR "Bind address on droplet for SSH reverse (localhost or 0.0.0.0)" "localhost"
 
   echo
@@ -227,7 +226,8 @@ if ! donep prereq; then
   echo "Disable SSH password authentication:        $DISABLE_PASSWORD_AUTH"
   echo "------------------"
   echo
-  echo "IMPORTANT: add the pentester PUBLIC KEY (shown above) to /root/.ssh/authorized_keys on the droplet now."
+  echo "IMPORTANT:"
+  echo "  Add the pentester PUBLIC KEY shown above to /root/.ssh/authorized_keys on the droplet now."
   echo "Press Enter when root key login should work; the script will verify and continue."
   read -r _
 
@@ -272,7 +272,7 @@ if ! donep step3; then
   maybe_prompt_reboot_and_exit
 fi
 
-# 4 core tooling (no BloodHound)
+# 4 core tooling
 if ! donep step4; then
   log "Installing core tools"
   apt-get update -y
@@ -289,7 +289,7 @@ if ! donep step4; then
 
   if [[ "$ENABLE_RDP" == "yes" ]]; then
     log "Enabling RDP"
-    apt-get install -y xrdp xorgxrdp
+    apt-get install -y xrdp xorgxrdp ssl-cert
     id -u xrdp >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin xrdp || true
     adduser xrdp ssl-cert || true
     make-ssl-cert generate-default-snakeoil --force-overwrite || true
@@ -328,12 +328,13 @@ if ! donep step6; then
   mark step6
 fi
 
-# 7 droplet bootstrap via ROOT key only (no passwords)
+# 7 droplet bootstrap via ROOT key only
 if ! donep step7; then
   log "Verifying root@${DROPLET_IP} key login"
   local_pub="$(get_pentester_pub || true)"
   if [[ -z "${local_pub:-}" ]]; then echo "No local pentester public key found"; exit 1; fi
 
+  # wait until root key login works
   while true; do
     if remote_root_key_ssh true 2>/dev/null; then
       log "Root key login ok."
@@ -344,6 +345,12 @@ if ! donep step7; then
     read -rp "Press Enter to retry root key login..." _
   done
 
+  # seed pentester's known_hosts with the droplet's key
+  sudo -u pentester mkdir -p /home/pentester/.ssh
+  sudo -u pentester ssh-keyscan -p "$DROPLET_SSH_PORT" "$DROPLET_IP" >> /home/pentester/.ssh/known_hosts || true
+  sudo chown pentester:pentester /home/pentester/.ssh/known_hosts
+  sudo chmod 600 /home/pentester/.ssh/known_hosts
+
   log "[Droplet] creating tunnel user and migrating pentester key"
   remote_root_key_ssh "id -u $TUNNEL_USER >/dev/null 2>&1 || useradd -m -s /bin/bash $TUNNEL_USER"
   remote_root_key_ssh "mkdir -p /home/$TUNNEL_USER/.ssh && chmod 700 /home/$TUNNEL_USER/.ssh"
@@ -352,7 +359,7 @@ if ! donep step7; then
     grep -qxF \"\$(cat /tmp/pentester_key.pub)\" \"\$auth\" || cat /tmp/pentester_key.pub >> \"\$auth\"; \
     rm -f /tmp/pentester_key.pub; chown -R $TUNNEL_USER:$TUNNEL_USER /home/$TUNNEL_USER/.ssh; chmod 700 /home/$TUNNEL_USER/.ssh; chmod 600 \"\$auth\""
 
-  # sanity: verify tunnel login using the pentester key explicitly
+  # verify tunnel login using pentester key
   PKEY="/home/pentester/.ssh/id_ed25519"; [[ -f "$PKEY" ]] || PKEY="/home/pentester/.ssh/id_rsa"
   if sudo -u pentester ssh -i "$PKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
       -p "$DROPLET_SSH_PORT" "$TUNNEL_USER@$DROPLET_IP" true 2>/dev/null; then
@@ -362,7 +369,7 @@ if ! donep step7; then
     exit 1
   fi
 
-  # optional: remove this exact pentester key from root, leaving any other root keys untouched
+  # optional key removal from root
   if [[ "${REMOVE_PENTESTER_KEY_FROM_ROOT}" == "yes" ]]; then
     log "[Droplet] removing pentester key from ROOT authorized_keys (others untouched)"
     remote_root_key_scp "$local_pub" "/tmp/pk.pub"
@@ -370,7 +377,7 @@ if ! donep step7; then
       awk 'NR==FNR{a[\$0]=1;next}!a[\$0]' /tmp/pk.pub \"\$R\" > \"\${R}.new\"; mv \"\${R}.new\" \"\$R\"; rm -f /tmp/pk.pub; chmod 600 \"\$R\""
   fi
 
-  # optional: tighten droplet auth to key-only and allow forwarding; adjust GatewayPorts if needed
+  # optional hardening to key-only and forwarding
   if [[ "${DISABLE_PASSWORD_AUTH}" == "yes" ]]; then
     log "[Droplet] disabling SSH password authentication (key-only)"
     remote_root_key_ssh "CFG=/etc/ssh/sshd_config; cp -a \"\$CFG\" \"\${CFG}.bak.\$(date +%s)\" 2>/dev/null || true; \
@@ -414,6 +421,7 @@ set -euo pipefail
 source /etc/autossh-reverse-tunnel.conf
 CMD=(/usr/bin/autossh -M 0 -N
      -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes"
+     -o "StrictHostKeyChecking=accept-new" -o "UserKnownHostsFile=${PENTESTER_HOME}/.ssh/known_hosts"
      -i "${PENTESTER_HOME}/.ssh/id_ed25519"
      -R "${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}")
 if [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" && -n "${RDP_REMOTE_PORT}" ]]; then
@@ -427,8 +435,8 @@ EOS
   cat >/etc/systemd/system/autossh-reverse-tunnel.service <<'EOF'
 [Unit]
 Description=Persistent reverse SSH tunnel to droplet (SSH and optional RDP)
-After=network.target ssh.service
-Wants=network.target
+After=network-online.target ssh.service
+Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/autossh-reverse-tunnel.conf
@@ -476,7 +484,7 @@ echo
 echo "Reverse SSH on droplet: ${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT} -> this host 22"
 if [[ "${ENABLE_RDP}" == "yes" ]]; then
   echo "RDP enabled locally on 3389 for user 'pentester'."
-  [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" ]] && echo "RDP reverse on droplet: ${RDP_BIND_ADDR}:${RDP_REMOTE_PORT} -> this host 3389"
+  [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" ]] && echo "RDP reverse: ${RDP_BIND_ADDR}:${RDP_REMOTE_PORT} -> this host 3389"
 fi
 echo "From the droplet shell: ssh -p ${REVERSE_REMOTE_PORT} pentester@127.0.0.1"
 echo "Validate any time: /usr/local/bin/validate_kali.sh"
