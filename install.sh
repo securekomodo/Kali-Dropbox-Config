@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Kali Dropbox Setup with prereq wizard
-# Standard user for remote ops: "pentester"
-# Safe to re-run. Handles reboot and resume.
-
 set -euo pipefail
 
 require_root(){ [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }; }
@@ -14,30 +10,20 @@ exec > >(tee -a "$LOGFILE") 2>&1
 STATE_DIR="/var/lib/kali-dropbox-setup"
 CONF_DIR="/etc/redline"
 CONF_FILE="${CONF_DIR}/dropbox.conf"
-mkdir -p "$STATE_DIR" "$CONF_DIR"
-chmod 700 "$CONF_DIR"
+mkdir -p "$STATE_DIR" "$CONF_DIR"; chmod 700 "$CONF_DIR"
 
 mark(){ touch "${STATE_DIR}/$1.done"; }
 donep(){ [[ -f "${STATE_DIR}/$1.done" ]]; }
 
-sanitize_hostname(){
-  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
-}
-
-prompt(){
-  local var="$1" msg="$2" def="${3:-}"
-  if [[ -n "${!var:-}" ]]; then return 0; fi
-  read -rp "$msg${def:+ [$def]}: " val
-  [[ -z "$val" && -n "$def" ]] && val="$def"
-  declare -g "$var"="$val"
-}
+sanitize_hostname(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'; }
+prompt(){ local v="$1" m="$2" d="${3:-}"; if [[ -n "${!v:-}" ]]; then return; fi; read -rp "$m${d:+ [$d]}: " x; [[ -z "$x" && -n "$d" ]] && x="$d"; declare -g "$v"="$x"; }
+prompt_secret(){ local v="$1" m="$2"; if [[ -n "${!v:-}" ]]; then return; fi; read -rsp "$m: " x; echo; declare -g "$v"="$x"; }
 
 need_reboot(){
   [[ -f /var/run/reboot-required ]] && return 0
   command -v needrestart >/dev/null 2>&1 && needrestart -b -r a 2>/dev/null | grep -qi "reboot is needed" && return 0
   return 1
 }
-
 schedule_resume(){
   local self; self="$(realpath "$0")"
   cat >/etc/systemd/system/kali-setup-resume.service <<EOF
@@ -51,26 +37,27 @@ ExecStart=${self} --resume
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now kali-setup-resume.service
+  systemctl daemon-reload; systemctl enable --now kali-setup-resume.service
 }
-
-clear_resume(){
-  systemctl disable --now kali-setup-resume.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/kali-setup-resume.service || true
-  systemctl daemon-reload
-}
+clear_resume(){ systemctl disable --now kali-setup-resume.service >/dev/null 2>&1 || true; rm -f /etc/systemd/system/kali-setup-resume.service || true; systemctl daemon-reload; }
 
 save_conf(){
   cat >"$CONF_FILE" <<EOF
 CLIENT_NAME='${CLIENT_NAME}'
 HOSTNAME='${HOSTNAME}'
-DROPLET_USER='${DROPLET_USER}'
+# droplet bootstrap (used once)
+DROPLET_ROOT='${DROPLET_ROOT}'
+DROPLET_PW='${DROPLET_PW}'
 DROPLET_IP='${DROPLET_IP}'
 DROPLET_SSH_PORT='${DROPLET_SSH_PORT}'
+# dedicated tunnel user created remotely
+TUNNEL_USER='${TUNNEL_USER}'
+# reverse tunnels
+REVERSE_BIND_ADDR='${REVERSE_BIND_ADDR}'
 REVERSE_REMOTE_PORT='${REVERSE_REMOTE_PORT}'
 ENABLE_RDP='${ENABLE_RDP}'
 EXPOSE_RDP_VIA_DROPLET='${EXPOSE_RDP_VIA_DROPLET}'
+RDP_BIND_ADDR='${RDP_BIND_ADDR}'
 RDP_REMOTE_PORT='${RDP_REMOTE_PORT}'
 EOF
   chmod 600 "$CONF_FILE"
@@ -80,114 +67,101 @@ load_conf(){ [[ -f "$CONF_FILE" ]] && source "$CONF_FILE" || true; }
 echo; echo "=== Kali Dropbox Setup $(date '+%F %T') ==="
 load_conf
 
-# -------- Prereq wizard (before any changes) --------
+# ---------------- PREREQ WIZARD ----------------
 if ! donep prereq; then
   prompt CLIENT_NAME "Client company name (e.g., Acme123)"
-  suggest="$(sanitize_hostname "$CLIENT_NAME")"
-  [[ -z "$suggest" ]] && suggest="client"
-  suggest="${suggest}-linux-vm"
-  echo "Suggested hostname: $suggest"
-  prompt HOSTNAME "Confirm or enter alternate hostname" "$suggest"
-  HOSTNAME="$(sanitize_hostname "$HOSTNAME")"
-  [[ -z "$HOSTNAME" ]] && { echo "Hostname cannot be empty"; exit 1; }
+  local_suggest="$(sanitize_hostname "$CLIENT_NAME")"; [[ -z "$local_suggest" ]] && local_suggest="client"
+  local_suggest="${local_suggest}-linux-vm"
+  echo "Suggested hostname: $local_suggest"
+  prompt HOSTNAME "Confirm or enter alternate hostname" "$local_suggest"
+  HOSTNAME="$(sanitize_hostname "$HOSTNAME")"; [[ -z "$HOSTNAME" ]] && { echo "Hostname cannot be empty"; exit 1; }
 
-  echo; echo "DigitalOcean reverse tunnel settings"
-  prompt DROPLET_USER "Droplet SSH user"
+  echo; echo "DigitalOcean droplet bootstrap (one time, will switch to keys and disable root password afterward)"
   prompt DROPLET_IP "Droplet public IP or DNS"
   prompt DROPLET_SSH_PORT "Droplet SSH port" "22"
-  prompt REVERSE_REMOTE_PORT "Remote port to expose this box SSH on the droplet" "20022"
+  prompt DROPLET_ROOT "Root username on droplet" "root"
+  prompt_secret DROPLET_PW "Root password on droplet (will be used once to set up keys)"
+  prompt TUNNEL_USER "Dedicated tunnel username to create on droplet" "tunnel"
 
-  echo; read -rp "Enable RDP on this box? (y/n) " yn
-  [[ "${yn,,}" == "y" ]] && ENABLE_RDP="yes" || ENABLE_RDP="no"
-  EXPOSE_RDP_VIA_DROPLET="no"; RDP_REMOTE_PORT=""
+  echo; echo "Reverse SSH"
+  prompt REVERSE_REMOTE_PORT "Remote port for SSH on droplet (e.g., 20022)" "20022"
+  echo "Bind address options on droplet: localhost (safe, only reachable from droplet) or 0.0.0.0 (exposed; use firewall)"
+  prompt REVERSE_BIND_ADDR "Bind address for SSH reverse port" "localhost"
+
+  echo; read -rp "Enable RDP on this box? (y/n) " yn; [[ "${yn,,}" == "y" ]] && ENABLE_RDP="yes" || ENABLE_RDP="no"
+  EXPOSE_RDP_VIA_DROPLET="no"; RDP_REMOTE_PORT=""; RDP_BIND_ADDR="localhost"
   if [[ "$ENABLE_RDP" == "yes" ]]; then
-    read -rp "Also expose RDP through the droplet? (y/n) " yn2
+    read -rp "Also expose RDP via droplet? (y/n) " yn2
     if [[ "${yn2,,}" == "y" ]]; then
       EXPOSE_RDP_VIA_DROPLET="yes"
-      prompt RDP_REMOTE_PORT "Remote port for RDP on droplet (3389 recommended only if firewall restricted)" "23389"
+      prompt RDP_REMOTE_PORT "Remote port for RDP on droplet" "23389"
+      echo "Bind address for RDP on droplet: localhost or 0.0.0.0"
+      prompt RDP_BIND_ADDR "Bind address for RDP reverse port" "localhost"
     fi
   fi
 
   echo; echo "----- Review -----"
   echo "Client:            $CLIENT_NAME"
   echo "Hostname:          $HOSTNAME"
-  echo "Droplet:           ${DROPLET_USER}@${DROPLET_IP}:${DROPLET_SSH_PORT}"
-  echo "Reverse SSH port:  $REVERSE_REMOTE_PORT"
-  echo "Enable RDP:        $ENABLE_RDP"
-  echo "Expose RDP via DO: $EXPOSE_RDP_VIA_DROPLET ${RDP_REMOTE_PORT:+(port $RDP_REMOTE_PORT)}"
+  echo "Droplet root user: $DROPLET_ROOT@$DROPLET_IP:$DROPLET_SSH_PORT"
+  echo "Tunnel user:       $TUNNEL_USER"
+  echo "SSH reverse:       ${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT} -> localhost:22"
+  if [[ "$ENABLE_RDP" == "yes" ]]; then
+    echo "RDP local:         3389 enabled"
+    [[ "$EXPOSE_RDP_VIA_DROPLET" == "yes" ]] && echo "RDP reverse:       ${RDP_BIND_ADDR}:${RDP_REMOTE_PORT} -> localhost:3389"
+  fi
   echo "------------------"
-  read -rp "Proceed with these settings? (y/n) " ok
-  [[ "${ok,,}" == "y" ]] || { echo "Aborted before making changes."; exit 1; }
+  read -rp "Proceed? (y/n) " ok; [[ "${ok,,}" == "y" ]] || { echo "Aborted."; exit 1; }
 
-  save_conf
-  mark prereq
+  save_conf; mark prereq
 fi
 
-# Reload for resume path
 load_conf
 
-# -------- System changes begin --------
-
-# 1 hostname and time
+# ---------------- LOCAL PREP ----------------
 if ! donep step1; then
   hostnamectl set-hostname "$HOSTNAME"
-  grep -q "$HOSTNAME" /etc/hosts || echo "127.0.1.1 ${HOSTNAME}" >> /etc/hosts
+  grep -q "$HOSTNAME" /etc/hosts || echo "127.0.1.1 $HOSTNAME" >> /etc/hosts
   timedatectl set-ntp true || true
   mark step1
 fi
 
-# 2 ensure pentester user
 if ! donep step2; then
   if ! id pentester &>/dev/null; then
-    echo "Creating user pentester for standard remote operations"
+    echo "Creating user pentester"
     useradd -m -s /bin/bash pentester
-    echo "Set password for pentester (used for console and RDP if enabled)"
+    echo "Set password for pentester (used for console and RDP)"
     passwd pentester
     usermod -aG sudo pentester
-  else
-    echo "User pentester already exists"
   fi
   echo "pentester ALL=(ALL) NOPASSWD:ALL" >/etc/sudoers.d/010_pentester_nopasswd
   chmod 440 /etc/sudoers.d/010_pentester_nopasswd
   mark step2
 fi
 
-# 3 update and reboot if needed
 if ! donep step3; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get -o Dpkg::Options::="--force-confnew" dist-upgrade -y
-  apt-get autoremove -y
-  apt-get autoclean -y
+  apt-get autoremove -y; apt-get autoclean -y
   apt-get install -y needrestart || true
-  if need_reboot; then
-    echo "Reboot required. Scheduling resume and rebooting."
-    schedule_resume
-    reboot
-    exit 0
-  fi
+  if need_reboot; then echo "Reboot required; resuming after boot"; schedule_resume; reboot; exit 0; fi
   mark step3
 fi
 
-# 4 core tooling
 if ! donep step4; then
   apt-get update -y
-  apt-get install -y \
-    git tmux vim jq curl wget unzip ca-certificates \
+  apt-get install -y git tmux vim jq curl wget unzip ca-certificates \
     build-essential python3 python3-pip python3-venv golang \
-    nmap masscan amass crackmapexec \
-    feroxbuster gobuster ffuf \
-    impacket-scripts bloodhound python3-bloodhound \
-    responder net-tools dnsutils socat autossh \
-    nuclei seclists zaproxy chromium \
-    openssh-server htop
+    nmap masscan amass crackmapexec feroxbuster gobuster ffuf \
+    impacket-scripts bloodhound python3-bloodhound responder \
+    net-tools dnsutils socat autossh sshpass ufw \
+    nuclei seclists zaproxy chromium openssh-server htop xrdp xorgxrdp || true
   runuser -l pentester -c 'nuclei -update-templates || true'
-  systemctl enable ssh
-  systemctl restart ssh
+  systemctl enable ssh; systemctl restart ssh
   mark step4
 fi
 
-# 5 SSH server baseline
 if ! donep step5; then
   sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
   sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
@@ -196,65 +170,79 @@ if ! donep step5; then
   grep -q '^ClientAliveInterval' /etc/ssh/sshd_config || echo 'ClientAliveInterval 60' >> /etc/ssh/sshd_config
   grep -q '^ClientAliveCountMax' /etc/ssh/sshd_config || echo 'ClientAliveCountMax 3' >> /etc/ssh/sshd_config
   systemctl restart ssh
+  for t in sleep.target suspend.target hibernate.target hybrid-sleep.target; do systemctl mask "$t" || true; done
   mark step5
 fi
 
-# 6 disable sleep
 if ! donep step6; then
-  for t in sleep.target suspend.target hibernate.target hybrid-sleep.target; do
-    systemctl mask "$t" || true
-  done
+  if [[ "${ENABLE_RDP}" == "yes" ]]; then
+    adduser xrdp ssl-cert || true
+    systemctl enable xrdp; systemctl restart xrdp
+    su - pentester -c 'echo "export DESKTOP_SESSION=kali-xfce" > ~/.xsessionrc'
+  fi
   mark step6
 fi
 
-# 7 optional RDP install and enable
+# Ensure local key exists for autossh
 if ! donep step7; then
-  if [[ "$ENABLE_RDP" == "yes" ]]; then
-    apt-get install -y xrdp xorgxrdp
-    adduser xrdp ssl-cert || true
-    systemctl enable xrdp
-    systemctl restart xrdp
-    # ensure pentester will use Xorg session
-    su - pentester -c 'mkdir -p ~/.xsessionrc.d; echo "export DESKTOP_SESSION=kali-xfce" > ~/.xsessionrc'
-    echo "RDP enabled. Connect to ${HOSTNAME}:3389 as user pentester."
-  else
-    echo "RDP not enabled."
+  runuser -l pentester -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
+  if ! runuser -l pentester -c 'test -f ~/.ssh/id_ed25519'; then
+    runuser -l pentester -c 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "kali-dropbox"'
   fi
   mark step7
 fi
 
-# 8 SSH key for pentester and droplet details
-if ! donep step8; then
-  runuser -l pentester -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh'
-  if ! runuser -l pentester -c 'test -f ~/.ssh/id_ed25519'; then
-    runuser -l pentester -c 'ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "kali-dropbox"'
-    echo "Created SSH key at /home/pentester/.ssh/id_ed25519"
-  fi
+# ---------------- DROPLET BOOTSTRAP (one time via root password) ----------------
+remote_ssh_root(){ sshpass -p "$DROPLET_PW" ssh -o StrictHostKeyChecking=no -p "$DROPLET_SSH_PORT" "$DROPLET_ROOT@$DROPLET_IP" "$@"; }
+remote_scp_root(){ SSH_ASKPASS=/bin/true sshpass -p "$DROPLET_PW" scp -o StrictHostKeyChecking=no -P "$DROPLET_SSH_PORT" "$1" "$DROPLET_ROOT@$DROPLET_IP:$2"; }
 
-  echo; echo "Add this public key to the droplet authorized_keys:"
-  echo "----- copy start -----"
-  cat /home/pentester/.ssh/id_ed25519.pub
-  echo "----- copy end -----"
+if ! donep droplet_bootstrap; then
+  echo "[Droplet] creating $TUNNEL_USER, installing key, and hardening sshd"
+  PUBKEY_LOCAL="/home/pentester/.ssh/id_ed25519.pub"
+  [[ -f "$PUBKEY_LOCAL" ]] || { echo "Missing $PUBKEY_LOCAL"; exit 1; }
 
-  read -rp "Attempt ssh-copy-id now? (y/n) " scpy
-  if [[ "${scpy,,}" == "y" ]]; then
-    apt-get install -y sshpass || true
-    runuser -l pentester -c "ssh-copy-id -i ~/.ssh/id_ed25519.pub -p ${DROPLET_SSH_PORT} ${DROPLET_USER}@${DROPLET_IP}" || echo "ssh-copy-id did not complete. Add the key manually if needed."
+  remote_ssh_root "id -u $TUNNEL_USER >/dev/null 2>&1 || useradd -m -s /bin/bash $TUNNEL_USER"
+  remote_ssh_root "mkdir -p /home/$TUNNEL_USER/.ssh && chmod 700 /home/$TUNNEL_USER/.ssh && chown -R $TUNNEL_USER:$TUNNEL_USER /home/$TUNNEL_USER/.ssh"
+  remote_scp_root "$PUBKEY_LOCAL" "/home/$TUNNEL_USER/.ssh/authorized_keys"
+  remote_ssh_root "chown $TUNNEL_USER:$TUNNEL_USER /home/$TUNNEL_USER/.ssh/authorized_keys && chmod 600 /home/$TUNNEL_USER/.ssh/authorized_keys"
+
+  # sshd hardening on droplet
+  DROPLET_SSHD_EDIT='
+    set -e
+    CFG="/etc/ssh/sshd_config"
+    cp "$CFG" "${CFG}.bak.$(date +%s)"
+    sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" "$CFG"
+    sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" "$CFG"
+    sed -i "s/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/" "$CFG"
+    sed -i "s/^#\?AllowTcpForwarding .*/AllowTcpForwarding yes/" "$CFG"
+    # Keep GatewayPorts default (no). If you chose 0.0.0.0 binds, allow clientspecified
+  '
+  if [[ "$REVERSE_BIND_ADDR" == "0.0.0.0" || "$RDP_BIND_ADDR" == "0.0.0.0" ]]; then
+    DROPLET_SSHD_EDIT+='
+      grep -q "^GatewayPorts " "$CFG" && sed -i "s/^GatewayPorts .*/GatewayPorts clientspecified/" "$CFG" || echo "GatewayPorts clientspecified" >> "$CFG"
+    '
   fi
-  mark step8
+  DROPLET_SSHD_EDIT+=$'\n''systemctl restart ssh'
+
+  remote_ssh_root "bash -lc '$DROPLET_SSHD_EDIT'"
+
+  echo "[Droplet] sshd set to key-only, root login disabled"
+  mark droplet_bootstrap
 fi
 
-# 9 autossh reverse tunnel service (SSH, and optional RDP)
-if ! donep step9; then
+# ---------------- AUTOSSH SERVICE (SSH and optional RDP) ----------------
+if ! donep autossh; then
   cat >/etc/autossh-reverse-tunnel.conf <<EOF
 AUTOSSH_GATETIME=0
 AUTOSSH_PORT=0
-DROPLET_USER="${DROPLET_USER}"
 DROPLET_IP="${DROPLET_IP}"
 DROPLET_SSH_PORT="${DROPLET_SSH_PORT}"
+TUNNEL_USER="${TUNNEL_USER}"
+REVERSE_BIND_ADDR="${REVERSE_BIND_ADDR}"
 REVERSE_REMOTE_PORT="${REVERSE_REMOTE_PORT}"
-RDP_REMOTE_PORT="${RDP_REMOTE_PORT:-}"
 EXPOSE_RDP_VIA_DROPLET="${EXPOSE_RDP_VIA_DROPLET}"
+RDP_BIND_ADDR="${RDP_BIND_ADDR}"
+RDP_REMOTE_PORT="${RDP_REMOTE_PORT}"
 LOCAL_SSH_PORT="22"
 LOCAL_RDP_PORT="3389"
 PENTESTER_HOME="/home/pentester"
@@ -265,14 +253,17 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/autossh-reverse-tunnel.conf
-args=(-M 0 -N -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes"
-      -i "${PENTESTER_HOME}/.ssh/id_ed25519"
-      -R "${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}")
+SSH_CMD=(/usr/bin/autossh -M 0 -N
+  -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" -o "ExitOnForwardFailure=yes"
+  -i "${PENTESTER_HOME}/.ssh/id_ed25519")
+# SSH reverse
+SSH_CMD+=(-R "${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT}:localhost:${LOCAL_SSH_PORT}")
+# Optional RDP reverse
 if [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" && -n "${RDP_REMOTE_PORT}" ]]; then
-  args+=(-R "${RDP_REMOTE_PORT}:localhost:${LOCAL_RDP_PORT}")
+  SSH_CMD+=(-R "${RDP_BIND_ADDR}:${RDP_REMOTE_PORT}:localhost:${LOCAL_RDP_PORT}")
 fi
-args+=(-p "${DROPLET_SSH_PORT}" "${DROPLET_USER}@${DROPLET_IP}")
-exec /usr/bin/autossh "${args[@]}"
+SSH_CMD+=(-p "${DROPLET_SSH_PORT}" "${TUNNEL_USER}@${DROPLET_IP}")
+exec "${SSH_CMD[@]}"
 EOS
   chmod +x /usr/local/bin/start-reverse-tunnel.sh
 
@@ -281,7 +272,6 @@ EOS
 Description=Persistent reverse SSH tunnel to droplet (SSH and optional RDP)
 After=network-online.target ssh.service
 Wants=network-online.target
-
 [Service]
 Type=simple
 EnvironmentFile=/etc/autossh-reverse-tunnel.conf
@@ -292,58 +282,50 @@ Restart=always
 RestartSec=5s
 NoNewPrivileges=yes
 PrivateTmp=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now autossh-reverse-tunnel.service
-  mark step9
+  mark autossh
 fi
 
-# 10 validation helper
-if ! donep step10; then
+# ---------------- VALIDATION AND FINISH ----------------
+if ! donep validate; then
   cat >/usr/local/bin/validate_kali.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-err=0; chk(){ printf "%-40s" "$1"; shift; if "$@"; then echo ok; else echo fail; err=1; fi; }
+err=0; chk(){ printf "%-44s" "$1"; shift; if "$@"; then echo ok; else echo fail; err=1; fi; }
 chk "Hostname set" bash -c '[[ -n "$(hostname)" ]]'
 chk "User pentester exists" id pentester
 chk "SSHD active" systemctl is-active --quiet ssh
 chk "autossh active" systemctl is-active --quiet autossh-reverse-tunnel.service
 chk "nmap present" command -v nmap >/dev/null
 chk "nuclei present" command -v nuclei >/dev/null
-if systemctl is-enabled xrdp >/dev/null 2>&1; then
-  chk "xrdp active" systemctl is-active --quiet xrdp
-fi
+if systemctl is-enabled xrdp >/dev/null 2>&1; then chk "xrdp active" systemctl is-active --quiet xrdp; fi
 echo "Done. Errors: $err"; exit $err
 EOF
   chmod +x /usr/local/bin/validate_kali.sh
-  mark step10
+  mark validate
 fi
 
-# 11 final tidy and optional reboot
-if ! donep step11; then
+# Final tidy and optional reboot
+if ! donep final; then
   apt-get update -y
   apt-get -o Dpkg::Options::="--force-confnew" dist-upgrade -y || true
-  apt-get autoremove -y
-  apt-get autoclean -y
-  if need_reboot; then
-    echo "Reboot required. Scheduling resume."
-    schedule_resume
-    reboot
-    exit 0
-  fi
-  mark step11
+  apt-get autoremove -y; apt-get autoclean -y
+  if need_reboot; then echo "Reboot required to finish; resuming after boot"; schedule_resume; reboot; exit 0; fi
+  mark final
 fi
 
 clear_resume
 echo
 echo "Setup complete."
-echo "SSH reverse port on droplet: ${REVERSE_REMOTE_PORT}"
+echo "SSH reverse on droplet: ${REVERSE_BIND_ADDR}:${REVERSE_REMOTE_PORT} -> this host 22"
 if [[ "${ENABLE_RDP}" == "yes" ]]; then
-  echo "RDP enabled locally on 3389 as user 'pentester'."
-  [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" ]] && echo "RDP also exposed on droplet port ${RDP_REMOTE_PORT}."
+  echo "RDP enabled locally on 3389 for user 'pentester'."
+  [[ "${EXPOSE_RDP_VIA_DROPLET}" == "yes" ]] && echo "RDP reverse on droplet: ${RDP_BIND_ADDR}:${RDP_REMOTE_PORT} -> this host 3389"
 fi
-echo "From droplet: ssh -p ${REVERSE_REMOTE_PORT} pentester@127.0.0.1"
-echo "Validate: /usr/local/bin/validate_kali.sh"
+echo "From the droplet itself: ssh -p ${REVERSE_REMOTE_PORT} pentester@127.0.0.1"
+[[ "${REVERSE_BIND_ADDR}" == "0.0.0.0" ]] && echo "If exposed on 0.0.0.0, restrict inbound with the cloud firewall."
+echo "Validate any time: /usr/local/bin/validate_kali.sh"
